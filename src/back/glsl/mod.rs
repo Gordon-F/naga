@@ -1502,7 +1502,10 @@ impl<'a, W: Write> Writer<'a, W> {
                     None
                 };
 
-                write!(self.out, "{}(", function.unwrap_or(""))?;
+                if let Some(func) = function {
+                    write!(self.out, "{}(", func)?;
+                }
+
                 self.write_expr(left, ctx)?;
 
                 if function.is_some() {
@@ -1536,7 +1539,9 @@ impl<'a, W: Write> Writer<'a, W> {
 
                 self.write_expr(right, ctx)?;
 
-                write!(self.out, ")")?
+                if function.is_some() {
+                    write!(self.out, ")")?
+                }
             }
             // `Select` is written as `condition ? accept : reject`
             // We wrap everything in parentheses to avoid precedence issues
