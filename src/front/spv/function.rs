@@ -28,7 +28,7 @@ pub enum Terminator {
     ///
     /// switch(SELECTOR) {
     ///  case TARGET_LITERAL#: {
-    ///    TARGET_BLOCK#  
+    ///    TARGET_BLOCK#
     ///  }
     ///  default: {
     ///    DEFAULT
@@ -189,7 +189,7 @@ impl<I: Iterator<Item = u32>> super::Parser<I> {
         if let Some(ep) = self.lookup_entry_point.remove(&fun_id) {
             // create a wrapping function
             let mut function = crate::Function {
-                name: None,
+                name: Some(ep.name.clone()),
                 arguments: Vec::new(),
                 result: None,
                 local_variables: Arena::new(),
