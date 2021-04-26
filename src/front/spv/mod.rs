@@ -2371,7 +2371,8 @@ impl<I: Iterator<Item = u32>> Parser<I> {
         if left != 0 {
             return Err(Error::InvalidOperand);
         }
-        self.future_decor.entry(id).or_default().name = Some(name);
+        self.future_decor.entry(id).or_default().name =
+            if name.is_empty() { None } else { Some(name) };
         Ok(())
     }
 
