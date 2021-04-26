@@ -1,4 +1,5 @@
 name: validation-macos
+on: push
 jobs:
   validate-macos:
     name: MSL
