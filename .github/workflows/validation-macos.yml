@@ -1,12 +1,4 @@
 name: validation-macos
-on:
-  push:
-    paths:
-    - 'tests/out/*.msl'
-  pull_request:
-    paths:
-    - 'tests/out/*.msl'
-
 jobs:
   validate-macos:
     name: MSL
