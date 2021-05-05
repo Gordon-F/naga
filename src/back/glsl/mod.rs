@@ -756,7 +756,14 @@ impl<'a, W: Write> Writer<'a, W> {
 
         // Finally write the global name and end the global with a `;` and a newline
         // Leading space is important
-        writeln!(self.out, " {};", self.get_global_name(handle, global))?;
+        let global_name = self.get_global_name(handle, global);
+        let global_str =
+            if let Some(default_value) = zero_init_value_str(&self.module.types[global.ty].inner) {
+                format!("{} = {}", global_name, default_value)
+            } else {
+                global_name
+            };
+        writeln!(self.out, " {};", global_str)?;
         writeln!(self.out)?;
 
         Ok(())
@@ -1127,6 +1134,14 @@ impl<'a, W: Write> Writer<'a, W> {
                         " {}",
                         &self.names[&NameKey::StructMember(handle, idx as u32)]
                     )?;
+                    // Do not write size for types with builtin bindings
+                    // implicitly sized arrays cannot be assigned
+                    if let Some(Binding::BuiltIn(_)) = member.binding {
+                        // Write type as dynamic size array
+                        writeln!(self.out, "[];")?;
+                        continue;
+                    }
+
                     // Write [size]
                     self.write_type(member.ty)?;
                     // Newline is important
@@ -2296,5 +2311,28 @@ fn glsl_storage_access(storage_access: StorageAccess) -> Option<&'static str> {
         Some("writeonly")
     } else {
         None
+    }
+}
+
+/// Helper function that return string with default zero initialization for supported types
+fn zero_init_value_str(inner: &TypeInner) -> Option<String> {
+    match *inner {
+        TypeInner::Scalar { kind, .. } => match kind {
+            ScalarKind::Bool => Some(String::from("false")),
+            _ => Some(String::from("0")),
+        },
+        TypeInner::Vector { size, kind, width } => {
+            if let Ok(scalar_string) = glsl_scalar(kind, width) {
+                let vec_type = format!("{}vec{}", scalar_string.prefix, size as u8);
+                match size {
+                    crate::VectorSize::Bi => Some(format!("{}(0, 0)", vec_type)),
+                    crate::VectorSize::Tri => Some(format!("{}(0, 0, 0)", vec_type)),
+                    crate::VectorSize::Quad => Some(format!("{}(0, 0, 0, 0)", vec_type)),
+                }
+            } else {
+                None
+            }
+        }
+        _ => None,
     }
 }
