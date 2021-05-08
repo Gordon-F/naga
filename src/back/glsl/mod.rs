@@ -1134,14 +1134,6 @@ impl<'a, W: Write> Writer<'a, W> {
                         " {}",
                         &self.names[&NameKey::StructMember(handle, idx as u32)]
                     )?;
-                    // Do not write size for types with builtin bindings
-                    // implicitly sized arrays cannot be assigned
-                    if let Some(Binding::BuiltIn(_)) = member.binding {
-                        // Write type as dynamic size array
-                        writeln!(self.out, "[];")?;
-                        continue;
-                    }
-
                     // Write [size]
                     self.write_type(member.ty)?;
                     // Newline is important
@@ -1373,17 +1365,50 @@ impl<'a, W: Write> Writer<'a, W> {
                             let value = value.unwrap();
                             match self.module.types[result.ty].inner {
                                 crate::TypeInner::Struct { ref members, .. } => {
+                                    let (mut is_temp_struct_used, mut return_struct) = (false, "");
+                                    if let Expression::Compose { .. } = ctx.expressions[value] {
+                                        is_temp_struct_used = true;
+                                        return_struct = "_tmp_return";
+                                        write!(
+                                            self.out,
+                                            "{} {} = ",
+                                            &self.names[&NameKey::Type(result.ty)],
+                                            return_struct
+                                        )?;
+                                        self.write_expr(value, ctx)?;
+                                        writeln!(self.out, ";")?;
+                                        write!(self.out, "{}", INDENT.repeat(indent))?;
+                                    }
                                     for (index, member) in members.iter().enumerate() {
+                                        // TODO: handle builtin in better way 
+                                        if let Some(Binding::BuiltIn(builtin)) = member.binding {
+                                            match builtin {
+                                                crate::BuiltIn::ClipDistance
+                                                | crate::BuiltIn::CullDistance
+                                                | crate::BuiltIn::PointSize => {
+                                                    if self.options.version.is_es() {
+                                                        continue;
+                                                    }
+                                                }
+                                                _ => {}
+                                            }
+                                        }
+
                                         let varying_name = VaryingName {
                                             binding: member.binding.as_ref().unwrap(),
                                             stage: ep.stage,
                                             output: true,
                                         };
+                                        let field_name = self.names
+                                            [&NameKey::StructMember(result.ty, index as u32)]
+                                            .clone();
                                         write!(self.out, "{} = ", varying_name)?;
-                                        self.write_expr(value, ctx)?;
-                                        let field_name = &self.names
-                                            [&NameKey::StructMember(result.ty, index as u32)];
-                                        writeln!(self.out, ".{};", field_name)?;
+
+                                        if !is_temp_struct_used {
+                                            self.write_expr(value, ctx)?;
+                                        }
+
+                                        writeln!(self.out, "{}.{};", return_struct, &field_name)?;
                                         write!(self.out, "{}", INDENT.repeat(indent))?;
                                     }
                                 }
