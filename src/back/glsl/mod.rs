@@ -1297,7 +1297,7 @@ impl<'a, W: Write> Writer<'a, W> {
                     }
 
                     // Write `break;` if the block isn't fallthrough
-                    if case.fall_through {
+                    if !case.fall_through {
                         writeln!(self.out, "{}break;", INDENT.repeat(indent + 2))?;
                     }
                 }
