@@ -25,7 +25,7 @@ jobs:
             SUCCESS_RESULT_COUNT=0
             FILE_COUNT=0
             mkdir -p out
-            find "Vulkan/data/shaders/glsl/base" -name '*.spv' | while read fname;
+            find "Vulkan/data/shaders/glsl/" -name '*.spv' | while read fname;
             do
                 echo "Convert: $fname"
                 FILE_COUNT=$((FILE_COUNT+1))
