@@ -22,12 +22,15 @@ jobs:
             touch counter
             SUCCESS_RESULT_COUNT=0
             FILE_COUNT=0
-            find "Vulkan/data/shaders/glsl/" -name '*.spv' | while read fname;
+            mkdir -p out
+            find "Vulkan/data/shaders/glsl/base" -name '*.spv' | while read fname;
             do
                 echo "Convert: $fname"
                 FILE_COUNT=$((FILE_COUNT+1))
-                target/release/naga --validate "${file}" "${file}.metal" | true
-                SUCCESS_RESULT_COUNT=$((SUCCESS_RESULT_COUNT + $?))
-                echo "Success: $SUCCESS_RESULT_COUNT/$FILE_COUNT" > counter
+                target/release/naga --validate 27 $(realpath ${fname}) out/$(basename ${fname}).metal
+                if [[ $? -eq 0 ]]; then
+                    SUCCESS_RESULT_COUNT=$((SUCCESS_RESULT_COUNT + 1))
+                fi
+                echo "Result: $(expr $FILE_COUNT - $SUCCESS_RESULT_COUNT) / $FILE_COUNT" > counter
             done
             cat counter
