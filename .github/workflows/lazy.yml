@@ -19,13 +19,15 @@ jobs:
           run: cargo build --release --all-features --bin naga
         - name: Convert metal shaders
           run: |
+            touch counter
             SUCCESS_RESULT_COUNT=0
             FILE_COUNT=0
             find "Vulkan/data/shaders/glsl/" -name '*.spv' | while read fname;
             do
                 echo "Convert: $fname"
                 FILE_COUNT=$((FILE_COUNT+1))
-                target/release/naga --validate ${file} ${file}.metal | true
+                target/release/naga --validate "${file}" "${file}.metal" | true
                 SUCCESS_RESULT_COUNT=$((SUCCESS_RESULT_COUNT + $?))
+                echo "Success: $SUCCESS_RESULT_COUNT/$FILE_COUNT" > counter
             done
-            echo "Success: $SUCCESS_RESULT_COUNT/$FILE_COUNT"
+            cat counter
