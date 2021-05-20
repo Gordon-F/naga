@@ -24,8 +24,8 @@ jobs:
             find "Vulkan/data/shaders/glsl/" -name '*.spv' | while read fname;
             do
                 echo "Convert: $fname"
-                FILE_COUNT=$(($FILE_COUNT + 1))
+                FILE_COUNT=$((FILE_COUNT+1))
                 target/release/naga --validate ${file} ${file}.metal | true
-                SUCCESS_RESULT_COUNT=$(($SUCCESS_RESULT_COUNT + $?))
+                SUCCESS_RESULT_COUNT=$((SUCCESS_RESULT_COUNT + $?))
             done
             echo "Success: $SUCCESS_RESULT_COUNT/$FILE_COUNT"
