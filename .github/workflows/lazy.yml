@@ -53,7 +53,7 @@ jobs:
             profile: minimal
             toolchain: stable
         - name: Download shaders
-          run: https://github.com/SaschaWillems/Vulkan.git
+          run: git clone https://github.com/SaschaWillems/Vulkan.git
         - name: Build Naga
           run: cargo build --release --all-features --bin naga
         - name: Convert metal shaders
