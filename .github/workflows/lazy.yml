@@ -1,8 +1,7 @@
 # Lazy jobs running on master post merges.
 name: lazy
-on:
-  push:
-    branches: [master]
+on: push
+# TODO    branches: [master]
 
 jobs:
   coverage:
@@ -44,3 +43,23 @@ jobs:
         run: cargo build --release --features spv-in,msl-out --bin naga
       - name: Convert shaders
         run: for file in data/*.spv ; do echo "Translating" ${file} && target/release/naga --validate 27 ${file} ${file}.metal; done
+  parse-vulkan-tutorial-shaders:
+      name: Parse Sascha Willems Vulkan tutorial shaders
+      runs-on: ubuntu-latest
+      steps:
+        - uses: actions/checkout@v2
+        - uses: actions-rs/toolchain@v1
+          with:
+            profile: minimal
+            toolchain: stable
+        - name: Download shaders
+          run: https://github.com/SaschaWillems/Vulkan.git
+        - name: Build Naga
+          run: cargo build --release --all-features --bin naga
+        - name: Convert metal shaders
+          run: |
+            find "Vulkan/data/shaders/glsl/" -name '*.spv' | while read fname;
+            do
+                echo "Convert: $fname"
+                target/release/naga --validate ${file} ${file}.metal
+            done
