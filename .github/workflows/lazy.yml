@@ -19,6 +19,8 @@ jobs:
           run: cargo build --release --all-features --bin naga
         - name: Convert metal shaders
           run: |
+            # No needed to stop workflow if we can't validate one file
+            set +e
             touch counter
             SUCCESS_RESULT_COUNT=0
             FILE_COUNT=0
@@ -27,7 +29,7 @@ jobs:
             do
                 echo "Convert: $fname"
                 FILE_COUNT=$((FILE_COUNT+1))
-                target/release/naga --validate 27 $(realpath ${fname}) out/$(basename ${fname}).metal
+                target/release/naga --validate 27 $(realpath ${fname}) out/$(basename ${fname}).metal | true
                 if [[ $? -eq 0 ]]; then
                     SUCCESS_RESULT_COUNT=$((SUCCESS_RESULT_COUNT + 1))
                 fi
