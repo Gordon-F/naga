@@ -90,23 +90,26 @@ jobs:
         run: git clone https://github.com/dneto0/spirv-samples.git
       - name: Build Naga
         run: cargo build --release --bin naga
-      - name: Convert metal shaders
+      - name: Install tools
+        run: sudo apt-get install glslang-tools
+      - name: Compile spv from spvasm
         run: |
-           # No needed to stop workflow if we can't validate one file
-           set +e
            cd spirv-samples
-           SUCCESS_RESULT_COUNT=0
-           FILE_COUNT=0
-           mkdir -p wgsl
            mkdir -p spv
 
-           echo "==== Compile spv from spvasm ===="
            find "./spvasm" -name '*.spvasm' | while read fname;
            do
                echo "Convert to spv with glslc: $fname"
                glslc --target-spv=spv1.3 $(realpath ${fname}) -o ./spv/$(basename ${fname}).spv
            done;
-           echo "================================"
+      - name: Validate spv and generate wgsl
+        run: |
+           set +e
+           cd spirv-samples
+           SUCCESS_RESULT_COUNT=0
+           FILE_COUNT=0
+           mkdir -p spv
+           mkdir -p wgsl
 
            echo "==== Validate spv and generate wgsl ===="
            rm -f counter
@@ -123,8 +126,13 @@ jobs:
                echo "Result: $(expr $FILE_COUNT - $SUCCESS_RESULT_COUNT) / $FILE_COUNT" > counter
            done
            cat counter
+      - name: Validate output wgsl
+        run: |
+           set +e
+           cd spirv-samples
+           SUCCESS_RESULT_COUNT=0
+           FILE_COUNT=0
 
-           echo "==== Validate wgsl ===="
            rm -f counter
            touch counter
 
