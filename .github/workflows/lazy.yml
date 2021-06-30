@@ -89,12 +89,8 @@ jobs:
         run: git clone https://github.com/dneto0/spirv-samples.git
       - name: Build Naga
         run: cargo build --release --bin naga
-      - name: Install vulkan-sdk
-        run: |
-           wget -qO - https://packages.lunarg.com/lunarg-signing-key-pub.asc | sudo apt-key add -
-           sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-1.2.176-focal.list https://packages.lunarg.com/vulkan/1.2.176/lunarg-vulkan-1.2.176-focal.list
-           sudo apt update
-           sudo apt install vulkan-sdk
+      - name: Install spirv-tools
+        run: sudo apt-get install spirv-tools
       - name: Compile spv from spvasm
         run: |
            cd spirv-samples
@@ -103,7 +99,7 @@ jobs:
            find "./spvasm" -name '*.spvasm' | while read fname;
            do
                echo "Convert to spv with glslc: $fname"
-               glslc --target-spv=spv1.3 $(realpath ${fname}) -o ./spv/$(basename ${fname}).spv
+               spirv-as --target-env=spv1.3 $(realpath ${fname}) -o ./spv/$(basename ${fname}).spv
            done;
       - name: Validate spv and generate wgsl
         run: |
