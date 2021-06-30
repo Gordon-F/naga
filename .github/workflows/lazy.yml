@@ -99,7 +99,7 @@ jobs:
            find "./spvasm" -name '*.spvasm' | while read fname;
            do
                echo "Convert to spv with glslc: $fname"
-               spirv-as --target-env=spv1.3 $(realpath ${fname}) -o ./spv/$(basename ${fname}).spv
+               spirv-as --target-env spv1.3 $(realpath ${fname}) -o ./spv/$(basename ${fname}).spv
            done;
       - name: Validate spv and generate wgsl
         run: |
