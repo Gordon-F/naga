@@ -1,5 +1,27 @@
-//TODO: temp
-#![allow(dead_code)]
+// Important note about `Expression::ImageQuery` and hlsl backend:
+// Due to implementation of `GetDimensions` function in hlsl (https://docs.microsoft.com/en-us/windows/win32/direct3dhlsl/dx-graphics-hlsl-to-getdimensions)
+// backend can't work with it as an expression.
+// Instead, it generates a unique wrapped function per `Expression::ImageQuery`, based on texure info and query function.
+// See `WrappedImageQuery` struct that represents a unique function and will be generated before writing all statements and expressions.
+// This allowed to works with `Expression::ImageQuery` as expression and write wrapped function.
+//
+// For example:
+// ```wgsl
+// let dim_1d = textureDimensions(image_1d);
+// ```
+//
+// ```hlsl
+// int NagaGetDimensions1DDimensions(Texture1D<float4>)
+// {
+//    uint4 ret;
+//    image_1d.GetDimensions(ret.x);
+//    return ret.x;
+// }
+//
+// int dim_1d = NagaGetDimensions1DDimensions(image_1d);
+// ```
+//
+
 use super::{Error, Options};
 use crate::{
     back,
@@ -16,8 +38,6 @@ type BackendResult = Result<(), Error>;
 /// Structure contains information required for generating
 /// wrapped structure of all entry points arguments
 struct EntryPointBinding {
-    /// Associated shader stage
-    stage: ShaderStage,
     /// Generated structure name
     name: String,
     /// Members of generated structure
@@ -30,6 +50,67 @@ struct EpStructMember {
     pub binding: Option<crate::Binding>,
 }
 
+#[derive(Clone, Copy, Debug, Hash, Eq, Ord, PartialEq, PartialOrd)]
+struct WrappedImageQuery {
+    dim: crate::ImageDimension,
+    arrayed: bool,
+    class: crate::ImageClass,
+    query: ImageQuery,
+}
+
+// HLSL backend requires its own `ImageQuery` enum.
+// It is used inside `WrappedImageQuery` and should be unique per ImageQuery function.
+// IR version can't be unique per function, because it's store mipmap level as an expression.
+//
+// For example:
+// ```wgsl
+// let dim_cube_array_lod = textureDimensions(image_cube_array, 1);
+// let dim_cube_array_lod2 = textureDimensions(image_cube_array, 1);
+// ```
+//
+// ```ir
+// ImageQuery {
+//  image: [1],
+//  query: Size {
+//      level: Some(
+//          [1],
+//      ),
+//  },
+// },
+// ImageQuery {
+//  image: [1],
+//  query: Size {
+//      level: Some(
+//          [2],
+//      ),
+//  },
+// },
+// ```
+//
+// HLSL should generate only 1 function for this case.
+//
+#[derive(Clone, Copy, Debug, Hash, Eq, Ord, PartialEq, PartialOrd)]
+enum ImageQuery {
+    Size,
+    SizeLevel,
+    NumLevels,
+    NumLayers,
+    NumSamples,
+}
+
+impl From<crate::ImageQuery> for ImageQuery {
+    fn from(q: crate::ImageQuery) -> Self {
+        use crate::ImageQuery as Iq;
+        match q {
+            Iq::Size { level: Some(_) } => ImageQuery::SizeLevel,
+            Iq::Size { level: None } => ImageQuery::Size,
+            Iq::NumLevels => ImageQuery::NumLevels,
+            Iq::NumLayers => ImageQuery::NumLayers,
+            Iq::NumSamples => ImageQuery::NumSamples,
+        }
+    }
+}
+
 pub struct Writer<'a, W> {
     out: W,
     names: crate::FastHashMap<NameKey, String>,
@@ -40,6 +121,7 @@ pub struct Writer<'a, W> {
     ep_inputs: Vec<Option<EntryPointBinding>>,
     /// Set of expressions that have associated temporary variables
     named_expressions: crate::NamedExpressions,
+    wrapped_image_queries: crate::FastHashSet<WrappedImageQuery>,
 }
 
 impl<'a, W: Write> Writer<'a, W> {
@@ -51,6 +133,7 @@ impl<'a, W: Write> Writer<'a, W> {
             options,
             ep_inputs: Vec::new(),
             named_expressions: crate::NamedExpressions::default(),
+            wrapped_image_queries: crate::FastHashSet::default(),
         }
     }
 
@@ -60,6 +143,7 @@ impl<'a, W: Write> Writer<'a, W> {
             .reset(module, super::keywords::RESERVED, &[], &mut self.names);
         self.named_expressions.clear();
         self.ep_inputs.clear();
+        self.wrapped_image_queries.clear();
     }
 
     pub fn write(
@@ -154,6 +238,9 @@ impl<'a, W: Write> Writer<'a, W> {
             };
             let name = self.names[&NameKey::Function(handle)].clone();
 
+            // Write wrapped function for `Expression::ImageQuery` before writing all statements and expressions
+            self.write_wrapped_image_query_functions(module, &function.body, &ctx)?;
+
             self.write_function(module, name.as_str(), function, &ctx)?;
 
             writeln!(self.out)?;
@@ -169,6 +256,9 @@ impl<'a, W: Write> Writer<'a, W> {
                 expressions: &ep.function.expressions,
                 named_expressions: &ep.function.named_expressions,
             };
+
+            // Write wrapped function for `Expression::ImageQuery` before writing all statements and expressions
+            self.write_wrapped_image_query_functions(module, &ep.function.body, &ctx)?;
 
             if ep.stage == ShaderStage::Compute {
                 // HLSL is calling workgroup size, num threads
@@ -266,7 +356,6 @@ impl<'a, W: Write> Writer<'a, W> {
             writeln!(self.out)?;
 
             let ep_input = EntryPointBinding {
-                stage,
                 name: struct_name,
                 members,
             };
@@ -290,19 +379,21 @@ impl<'a, W: Write> Writer<'a, W> {
         let global = &module.global_variables[handle];
         let inner = &module.types[global.ty].inner;
 
-        if let Some(storage_access) = storage_access(global.storage_access) {
-            write!(self.out, "{} ", storage_access)?;
-        }
-
-        let (storage_class, register_ty) = match *inner {
-            TypeInner::Image { .. } => ("", "t"),
+        let (storage, register_ty) = match *inner {
+            TypeInner::Image { .. } => {
+                if global.storage_access.contains(crate::StorageAccess::STORE) {
+                    ("RW", "u")
+                } else {
+                    ("", "t")
+                }
+            }
             TypeInner::Sampler { .. } => ("", "s"),
             TypeInner::Struct { .. } | TypeInner::Vector { .. } => ("static ", ""),
             // TODO: other register ty https://docs.microsoft.com/en-us/windows/win32/direct3dhlsl/dx-graphics-hlsl-variable-register
             _ => return Err(Error::Unimplemented(format!("register_ty {:?}", inner))),
         };
 
-        write!(self.out, "{}", storage_class)?;
+        write!(self.out, "{}", storage)?;
         self.write_type(module, global.ty)?;
         if let TypeInner::Array { size, .. } = module.types[global.ty].inner {
             self.write_array_size(module, size)?;
@@ -314,7 +405,11 @@ impl<'a, W: Write> Writer<'a, W> {
         )?;
 
         if let Some(ref binding) = global.binding {
-            writeln!(self.out, " : register({}{});", register_ty, binding.binding)?;
+            write!(self.out, " : register({}{}", register_ty, binding.binding)?;
+            if self.options.shader_model > super::ShaderModel::V5_0 {
+                write!(self.out, ", space{}", binding.group)?;
+            }
+            writeln!(self.out, ");")?;
         } else {
             write!(self.out, " = ")?;
             if let Some(init) = global.init {
@@ -537,26 +632,39 @@ impl<'a, W: Write> Writer<'a, W> {
             }
             TypeInner::Image {
                 dim,
-                arrayed: _, //TODO:
+                arrayed,
                 class,
             } => {
+                use crate::ImageClass as Ic;
+
                 let dim_str = image_dimension_str(dim);
-                if let crate::ImageClass::Sampled { kind, multi: false } = class {
-                    write!(
+                match class {
+                    Ic::Sampled { kind, multi } => write!(
                         self.out,
-                        "Texture{}<{}4>",
+                        "Texture{}{}{}<{}4>",
                         dim_str,
+                        if multi { "MS" } else { "" },
+                        if arrayed { "Array" } else { "" },
                         scalar_kind_str(kind, 4)?
-                    )?
-                } else {
-                    return Err(Error::Unimplemented(format!(
-                        "write_value_type {:?}",
-                        inner
-                    )));
+                    )?,
+                    Ic::Depth => write!(self.out, "Texture{}", dim_str)?,
+                    Ic::Storage(format) => {
+                        let texture_type =
+                            storage_format_to_texture_type(format).ok_or_else(|| {
+                                Error::Unimplemented(format!("write_value_type {:?}", inner))
+                            })?;
+
+                        write!(self.out, "Texture{}<{}>", dim_str, texture_type)?
+                    }
                 }
             }
-            TypeInner::Sampler { comparison: false } => {
-                write!(self.out, "SamplerState")?;
+            TypeInner::Sampler { comparison } => {
+                let sampler = if comparison {
+                    "SamplerComparisonState"
+                } else {
+                    "SamplerState"
+                };
+                write!(self.out, "{}", sampler)?;
             }
             // HLSL arrays are written as `type name[size]`
             // Current code is written arrays only as `[size]`
@@ -893,6 +1001,23 @@ impl<'a, W: Write> Writer<'a, W> {
                     )?;
                 }
             }
+            Statement::ImageStore {
+                image,
+                coordinate,
+                array_index: _, // TODO:
+                value,
+            } => {
+                write!(self.out, "{}", INDENT.repeat(indent))?;
+                self.write_expr(module, image, func_ctx)?;
+
+                write!(self.out, "[")?;
+                self.write_expr(module, coordinate, func_ctx)?;
+                write!(self.out, "]")?;
+
+                write!(self.out, " = ")?;
+                self.write_expr(module, value, func_ctx)?;
+                writeln!(self.out, ";")?;
+            }
             _ => return Err(Error::Unimplemented(format!("write_stmt {:?}", stmt))),
         }
 
@@ -1023,19 +1148,173 @@ impl<'a, W: Write> Writer<'a, W> {
             }
             Expression::ImageSample {
                 image,
-                sampler,        // TODO:
-                coordinate,     // TODO:
-                array_index: _, // TODO:
-                offset: _,      // TODO:
-                level: _,       // TODO:
-                depth_ref: _,   // TODO:
+                sampler,
+                coordinate,
+                array_index,
+                offset,
+                level,
+                depth_ref,
             } => {
+                use crate::SampleLevel as Sl;
+
+                let texture_func = match level {
+                    Sl::Auto => {
+                        if depth_ref.is_some() {
+                            "SampleCmp"
+                        } else {
+                            "Sample"
+                        }
+                    }
+                    Sl::Zero => "SampleCmpLevelZero",
+                    Sl::Exact(_) => "SampleLevel",
+                    Sl::Bias(_) => "SampleBias",
+                    Sl::Gradient { .. } => "SampleGrad",
+                };
+
                 self.write_expr(module, image, func_ctx)?;
-                write!(self.out, ".Sample(")?;
+                write!(self.out, ".{}(", texture_func)?;
                 self.write_expr(module, sampler, func_ctx)?;
                 write!(self.out, ", ")?;
                 self.write_expr(module, coordinate, func_ctx)?;
+
+                if let Some(array_index) = array_index {
+                    write!(self.out, ", ")?;
+                    self.write_expr(module, array_index, func_ctx)?;
+                }
+
+                if let Some(depth_ref) = depth_ref {
+                    write!(self.out, ", ")?;
+                    self.write_expr(module, depth_ref, func_ctx)?;
+                }
+
+                match level {
+                    Sl::Auto => {}
+                    Sl::Zero => {
+                        // Level 0 is implied for depth comparison
+                        if depth_ref.is_none() {
+                            write!(self.out, ", 0.0")?;
+                        }
+                    }
+                    Sl::Exact(expr) => {
+                        write!(self.out, ", ")?;
+                        self.write_expr(module, expr, func_ctx)?;
+                    }
+                    Sl::Bias(expr) => {
+                        write!(self.out, ", ")?;
+                        self.write_expr(module, expr, func_ctx)?;
+                    }
+                    Sl::Gradient { x, y } => {
+                        write!(self.out, ", ")?;
+                        self.write_expr(module, x, func_ctx)?;
+                        write!(self.out, ", ")?;
+                        self.write_expr(module, y, func_ctx)?;
+                    }
+                }
+
+                if let Some(offset) = offset {
+                    write!(self.out, ", ")?;
+                    self.write_constant(module, offset)?;
+                }
+
                 write!(self.out, ")")?;
+            }
+            Expression::ImageQuery { image, query } => {
+                // use wrapped image query function
+                if let TypeInner::Image {
+                    dim,
+                    arrayed,
+                    class,
+                } = *func_ctx.info[image].ty.inner_with(&module.types)
+                {
+                    let wrapped_image_query = WrappedImageQuery {
+                        dim,
+                        arrayed,
+                        class,
+                        query: query.into(),
+                    };
+
+                    self.write_wrapped_image_query_function_name(wrapped_image_query)?;
+                    write!(self.out, "(")?;
+                    // Image always first param
+                    self.write_expr(module, image, func_ctx)?;
+                    if let crate::ImageQuery::Size { level: Some(level) } = query {
+                        write!(self.out, ", ")?;
+                        self.write_expr(module, level, func_ctx)?;
+                    }
+                    write!(self.out, ")")?;
+                }
+            }
+            Expression::ImageLoad {
+                image,
+                coordinate,
+                array_index: _, // TODO:
+                index: _,       // TODO:
+            } => {
+                // https://docs.microsoft.com/en-us/windows/win32/direct3dhlsl/dx-graphics-hlsl-to-load
+                let image_ty = func_ctx.info[image].ty.inner_with(&module.types);
+                if let crate::TypeInner::Image {
+                    dim,
+                    arrayed,
+                    class,
+                } = *image_ty
+                {
+                    use crate::ImageDimension as IDim;
+
+                    self.write_expr(module, image, func_ctx)?;
+                    write!(self.out, ".Load(")?;
+
+                    let ms = if let crate::ImageClass::Sampled { multi: true, .. } = class {
+                        true
+                    } else {
+                        false
+                    };
+
+                    // Input location type based on texture type
+                    let (coordinate_param_ty, numb_of_components) = match dim {
+                        IDim::D1 => {
+                            if arrayed {
+                                ("int3", 3)
+                            } else {
+                                ("int2", 2)
+                            }
+                        }
+                        IDim::D2 => match (ms, arrayed) {
+                            (true, true) => ("int3", 3),
+                            (true, false) => ("int2", 2),
+                            (false, true) => ("int4", 4),
+                            (false, false) => ("int3", 3),
+                        },
+                        IDim::D3 => ("int4", 4),
+                        _ => unreachable!(),
+                    };
+
+                    let coordinate_expr_numb_of_components =
+                        match *func_ctx.info[coordinate].ty.inner_with(&module.types) {
+                            TypeInner::Vector { size, .. } => number_of_components(size),
+                            // It can be only vector
+                            _ => unreachable!(),
+                        };
+
+                    write!(self.out, "{}(", coordinate_param_ty)?;
+                    self.write_expr(module, coordinate, func_ctx)?;
+                    let additional_params = numb_of_components - coordinate_expr_numb_of_components;
+                    for _ in 0..additional_params {
+                        write!(self.out, ", 0",)?;
+                    }
+                    write!(self.out, ")")?;
+
+                    /* TODO:
+                    if let Some(array_index) = array_index {
+                        write!(self.out, ", ")?;
+                        self.write_expr(module, array_index, func_ctx)?;
+                    }
+                    if let Some(index) = index {
+                        write!(self.out, ", ")?;
+                        self.write_expr(module, index, func_ctx)?;
+                    }
+                    */
+                    write!(self.out, ")")?;
+                }
             }
             // TODO: copy-paste from wgsl-out
             Expression::GlobalVariable(handle) => {
@@ -1376,6 +1655,182 @@ impl<'a, W: Write> Writer<'a, W> {
 
         Ok(())
     }
+
+    /// Helper function that write wrapped function for `Expression::ImageQuery`
+    /// https://docs.microsoft.com/en-us/windows/win32/direct3dhlsl/dx-graphics-hlsl-to-getdimensions
+    fn write_wrapped_image_query_functions(
+        &mut self,
+        module: &Module,
+        func_body: &[crate::Statement],
+        func_ctx: &back::FunctionCtx<'_>,
+    ) -> BackendResult {
+        for sta in func_body.iter() {
+            if let crate::Statement::Emit(ref range) = *sta {
+                for handle in range.clone() {
+                    if let crate::Expression::ImageQuery { image, query } =
+                        func_ctx.expressions[handle]
+                    {
+                        let image_ty = func_ctx.info[image].ty.inner_with(&module.types);
+                        if let crate::TypeInner::Image {
+                            dim,
+                            arrayed,
+                            class,
+                        } = *image_ty
+                        {
+                            let ret_ty = func_ctx.info[handle].ty.inner_with(&module.types);
+
+                            let wrapped_image_query = WrappedImageQuery {
+                                dim,
+                                arrayed,
+                                class,
+                                query: query.into(),
+                            };
+
+                            if !self.wrapped_image_queries.contains(&wrapped_image_query) {
+                                // Write function return type and name
+                                self.write_value_type(module, ret_ty)?;
+                                write!(self.out, " ")?;
+                                self.write_wrapped_image_query_function_name(wrapped_image_query)?;
+
+                                // Write function parameters
+                                write!(self.out, "(")?;
+                                // Texture always first parameter
+                                self.write_value_type(module, image_ty)?;
+                                // Mipmap is a second parameter if exists
+                                const MIP_LEVEL_PARAM: &str = "MipLevel";
+                                if let crate::ImageQuery::Size { level: Some(_) } = query {
+                                    write!(self.out, ", uint {}", MIP_LEVEL_PARAM)?;
+                                }
+                                writeln!(self.out, ")")?;
+
+                                // Write function body
+                                writeln!(self.out, "{{")?;
+                                const RETURN_VARIABLE_NAME: &str = "ret";
+
+                                use crate::ImageDimension as IDim;
+                                use crate::ImageQuery as Iq;
+
+                                let array_coords = if arrayed { 1 } else { 0 };
+                                // GetDimensions Overloaded Methods
+                                // https://docs.microsoft.com/en-us/windows/win32/direct3dhlsl/dx-graphics-hlsl-to-getdimensions#overloaded-methods
+                                let (ret_swizzle, number_of_params) = match query {
+                                    Iq::Size { .. } => match dim {
+                                        IDim::D1 => ("x", 1 + array_coords),
+                                        IDim::D2 => ("xy", 3 + array_coords),
+                                        IDim::D3 => ("xyz", 4),
+                                        IDim::Cube => ("xy", 3 + array_coords),
+                                    },
+                                    Iq::NumLevels | Iq::NumSamples | Iq::NumLayers => {
+                                        if arrayed || dim == IDim::D3 {
+                                            ("w", 4)
+                                        } else {
+                                            ("z", 3)
+                                        }
+                                    }
+                                };
+
+                                // Write `GetDimensions` function.
+                                writeln!(
+                                    self.out,
+                                    "{}uint4 {};",
+                                    back::INDENT,
+                                    RETURN_VARIABLE_NAME
+                                )?;
+                                write!(self.out, "{}", back::INDENT)?;
+                                self.write_expr(module, image, func_ctx)?;
+                                write!(self.out, ".GetDimensions(")?;
+                                match query {
+                                    Iq::Size { level: Some(_) } => {
+                                        write!(self.out, "{}, ", MIP_LEVEL_PARAM)?;
+                                    }
+                                    _ =>
+                                    // Write zero mipmap level for supported types
+                                    {
+                                        if let crate::ImageClass::Sampled { multi: true, .. } =
+                                            class
+                                        {
+                                        } else {
+                                            match dim {
+                                                IDim::D2 | IDim::D3 | IDim::Cube => {
+                                                    write!(self.out, "0, ")?;
+                                                }
+                                                IDim::D1 => {}
+                                            }
+                                        }
+                                    }
+                                }
+                                for i in 0..number_of_params {
+                                    if i == (number_of_params - 1) {
+                                        // write last parameter without comma and space for last parameter
+                                        write!(
+                                            self.out,
+                                            "{}.{}",
+                                            RETURN_VARIABLE_NAME,
+                                            back::COMPONENTS[i]
+                                        )?;
+                                    } else {
+                                        write!(
+                                            self.out,
+                                            "{}.{}, ",
+                                            RETURN_VARIABLE_NAME,
+                                            back::COMPONENTS[i]
+                                        )?;
+                                    }
+                                }
+                                writeln!(self.out, ");")?;
+
+                                // Write return value
+                                writeln!(
+                                    self.out,
+                                    "{}return {}.{};",
+                                    back::INDENT,
+                                    RETURN_VARIABLE_NAME,
+                                    ret_swizzle
+                                )?;
+
+                                // End of function body
+                                writeln!(self.out, "}}")?;
+                                // Write extra new line
+                                writeln!(self.out)?;
+
+                                self.wrapped_image_queries.insert(wrapped_image_query);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn write_wrapped_image_query_function_name(
+        &mut self,
+        query: WrappedImageQuery,
+    ) -> BackendResult {
+        let dim_str = image_dimension_str(query.dim);
+        let class_str = match query.class {
+            crate::ImageClass::Sampled { multi: true, .. } => "MS",
+            crate::ImageClass::Depth => "Depth",
+            _ => "",
+        };
+        let arrayed_str = if query.arrayed { "Array" } else { "" };
+        let query_str = match query.query {
+            ImageQuery::Size => "Dimensions",
+            ImageQuery::SizeLevel => "MipDimensions",
+            ImageQuery::NumLevels => "NumLevels",
+            ImageQuery::NumLayers => "NumLayers",
+            ImageQuery::NumSamples => "NumSamples",
+        };
+
+        write!(
+            self.out,
+            "Naga{}{}{}{}",
+            dim_str, class_str, arrayed_str, query_str,
+        )?;
+
+        Ok(())
+    }
 }
 
 fn image_dimension_str(dim: crate::ImageDimension) -> &'static str {
@@ -1434,24 +1889,6 @@ fn scalar_kind_str(kind: crate::ScalarKind, width: crate::Bytes) -> Result<&'sta
     }
 }
 
-fn storage_access(storage_access: crate::StorageAccess) -> Option<&'static str> {
-    if storage_access == crate::StorageAccess::LOAD {
-        Some("ByteAddressBuffer")
-    } else if storage_access.is_all() {
-        Some("RWByteAddressBuffer")
-    } else {
-        None
-    }
-}
-
-fn number_of_components(vector_size: crate::VectorSize) -> usize {
-    match vector_size {
-        crate::VectorSize::Bi => 2,
-        crate::VectorSize::Tri => 3,
-        crate::VectorSize::Quad => 4,
-    }
-}
-
 /// Helper function that returns the string corresponding to the HLSL interpolation qualifier
 fn interpolation_str(interpolation: crate::Interpolation) -> &'static str {
     use crate::Interpolation as I;
@@ -1471,5 +1908,33 @@ fn sampling_str(sampling: crate::Sampling) -> Option<&'static str> {
         S::Center => None,
         S::Centroid => Some("centroid"),
         S::Sample => Some("sample"),
+    }
+}
+
+fn storage_format_to_texture_type(format: crate::StorageFormat) -> Option<&'static str> {
+    use crate::StorageFormat as Sf;
+
+    match format {
+        Sf::Rgba8Unorm
+        | Sf::Rgba8Snorm
+        | Sf::Rgba16Float
+        | Sf::R32Float
+        | Sf::Rg32Float
+        | Sf::Rgba32Float => Some("float4"),
+        Sf::Rgba8Uint | Sf::Rgba16Uint | Sf::R32Uint | Sf::Rg32Uint | Sf::Rgba32Uint => {
+            Some("uint4")
+        }
+        Sf::Rgba8Sint | Sf::Rgba16Sint | Sf::R32Sint | Sf::Rg32Sint | Sf::Rgba32Sint => {
+            Some("int4")
+        }
+        _ => None,
+    }
+}
+
+fn number_of_components(vector_size: crate::VectorSize) -> usize {
+    match vector_size {
+        crate::VectorSize::Bi => 2,
+        crate::VectorSize::Tri => 3,
+        crate::VectorSize::Quad => 4,
     }
 }
